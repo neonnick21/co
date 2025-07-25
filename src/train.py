@@ -39,7 +39,7 @@ def train_rfdetr(
             for b in range(images.size(0)):
                 tgt_labels = targets[b]['labels'].to(device)
                 tgt_boxes = targets[b]['boxes'].to(device)
-                indices = hungarian_matcher(pred_logits[b], pred_boxes[b], tgt_labels, tgt_boxes)
+                indices = simple_hungarian_matcher(pred_logits[b], pred_boxes[b], tgt_labels, tgt_boxes)
                 if len(indices) == 0:
                     continue
                 pred_idx, tgt_idx = zip(*indices)
@@ -73,7 +73,7 @@ def train_rfdetr(
                 for b in range(images.size(0)):
                     tgt_labels = targets[b]['labels'].to(device)
                     tgt_boxes = targets[b]['boxes'].to(device)
-                    indices = hungarian_matcher(pred_logits[b], pred_boxes[b], tgt_labels, tgt_boxes)
+                    indices = simple_hungarian_matcher(pred_logits[b], pred_boxes[b], tgt_labels, tgt_boxes)
                     if len(indices) == 0:
                         continue
                     pred_idx, tgt_idx = zip(*indices)
@@ -105,9 +105,24 @@ def train_rfdetr(
 
 def simple_hungarian_matcher(pred_logits, pred_boxes, tgt_labels, tgt_boxes):
     """
+    Simple Hungarian matcher for DETR-style models.
+    Matches predictions to targets based on class and box L1 cost.
+    Returns list of (pred_idx, tgt_idx).
+    """
+    if len(tgt_labels) == 0 or len(pred_logits) == 0:
+        return []
+    out_prob = F.softmax(pred_logits, -1).detach().cpu().numpy()  # (num_queries, num_classes+1)
+    tgt_labels_np = tgt_labels.detach().cpu().numpy()
+    class_cost = -out_prob[:, tgt_labels_np]  # (num_queries, num_targets)
+    pred_boxes_np = pred_boxes.detach().cpu().numpy()
+    tgt_boxes_np = tgt_boxes.detach().cpu().numpy()
+    bbox_cost = np.abs(pred_boxes_np[:, None, :] - tgt_boxes_np[None, :, :]).sum(-1)  # (num_queries, num_targets)
+    C = class_cost + bbox_cost
+    row_ind, col_ind = linear_sum_assignment(C)
+    matches = list(zip(row_ind, col_ind))
+    return matches
 
-# --- Hungarian Matcher ---
-    # Example usage
+if __name__ == '__main__':
     DATA_DIR = os.path.join(os.path.dirname(__file__), '..', 'data')
     NUM_CLASSES = 3  # BCCD: WBC, RBC, Platelets
     train_rfdetr(DATA_DIR, num_classes=NUM_CLASSES)
