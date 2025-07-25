@@ -42,6 +42,13 @@ def train_rfdetr(
                 indices = simple_hungarian_matcher(pred_logits[b], pred_boxes[b], tgt_labels, tgt_boxes)
                 if len(indices) == 0:
                     continue
+                if tgt_labels.numel() == 0 or tgt_boxes.numel() == 0:
+                    print(f"Skipping image {b}: no targets.")
+                    continue
+                indices = simple_hungarian_matcher(pred_logits[b], pred_boxes[b], tgt_labels, tgt_boxes)
+                print(f"Image {b}: {len(indices)} matches")
+                if len(indices) == 0:
+                    continue
                 pred_idx, tgt_idx = zip(*indices)
                 matched_logits = pred_logits[b][list(pred_idx)]
                 matched_boxes = pred_boxes[b][list(pred_idx)]
@@ -50,8 +57,9 @@ def train_rfdetr(
                 loss_cls = loss_labels(matched_logits, matched_labels)
                 loss_bbox = loss_boxes(matched_boxes, matched_boxes_gt)
                 loss_giou_val = loss_giou(matched_boxes, matched_boxes_gt)
-                total_loss = loss_cls + loss_bbox + loss_giou_val
-                batch_losses.append(total_loss)
+                total_loss_img = loss_cls + loss_bbox + loss_giou_val
+                print(f"  Losses: cls={loss_cls.item():.4f}, bbox={loss_bbox.item():.4f}, giou={loss_giou_val.item():.4f}, total={total_loss_img.item():.4f}")
+                batch_losses.append(total_loss_img)
             if batch_losses:
                 batch_loss = torch.stack(batch_losses).mean()
                 optimizer.zero_grad()
@@ -76,6 +84,12 @@ def train_rfdetr(
                     indices = simple_hungarian_matcher(pred_logits[b], pred_boxes[b], tgt_labels, tgt_boxes)
                     if len(indices) == 0:
                         continue
+                    if tgt_labels.numel() == 0 or tgt_boxes.numel() == 0:
+                        print(f"Skipping val image {b}: no targets.")
+                        continue
+                    indices = simple_hungarian_matcher(pred_logits[b], pred_boxes[b], tgt_labels, tgt_boxes)
+                    if len(indices) == 0:
+                        continue
                     pred_idx, tgt_idx = zip(*indices)
                     matched_logits = pred_logits[b][list(pred_idx)]
                     matched_boxes = pred_boxes[b][list(pred_idx)]
@@ -84,8 +98,8 @@ def train_rfdetr(
                     loss_cls = loss_labels(matched_logits, matched_labels)
                     loss_bbox = loss_boxes(matched_boxes, matched_boxes_gt)
                     loss_giou_val = loss_giou(matched_boxes, matched_boxes_gt)
-                    total_loss = loss_cls + loss_bbox + loss_giou_val
-                    batch_losses.append(total_loss)
+                    total_loss_img = loss_cls + loss_bbox + loss_giou_val
+                    batch_losses.append(total_loss_img)
                 if batch_losses:
                     batch_loss = torch.stack(batch_losses).mean()
                     val_loss += batch_loss.item()
