@@ -92,7 +92,8 @@ def resize_and_normalize_images(image_dir, size=(416, 416)):
         if img_name.lower().endswith(('.jpg', '.png')):
             img_path = os.path.join(image_dir, img_name)
             img = Image.open(img_path).convert('RGB')
-            img = img.resize(size, Image.ANTIALIAS)
+            # Use LANCZOS for high-quality downsampling (Pillow >= 10.0.0)
+            img = img.resize(size, Image.Resampling.LANCZOS)
             img.save(img_path)
     print(f"Resized and normalized images in {image_dir} to {size}")
 
@@ -153,14 +154,8 @@ if __name__ == '__main__':
     DATA_DIR = os.path.join(os.path.dirname(__file__), '..', 'data')
     # 1. Download and extract dataset
     download_and_extract_bccd(DATA_DIR)
-    # 2. Split dataset into train/val/test
-    bccd_dir = os.path.join(DATA_DIR, 'BCCD.v4i.coco')
-    coco_json = os.path.join(bccd_dir, 'valid', '_annotations.coco.json')
-    images_dir = os.path.join(bccd_dir, 'valid')
-    if os.path.exists(coco_json):
-        split_coco_dataset(coco_json, images_dir, DATA_DIR)
-    else:
-        print(f"COCO annotation file not found: {coco_json}")
+    # 2. Fix data layout for Roboflow structure (move images/annotations)
+    fix_data_layout()
     # 3. Resize and normalize images in each split
     for split in ['train', 'val', 'test']:
         split_img_dir = os.path.join(DATA_DIR, 'images', split)
