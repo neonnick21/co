@@ -1,14 +1,13 @@
 import os
 import torch
+import torch.nn.functional as F
+import numpy as np
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import StepLR
 from src.model.detr_rfdetr import RFDETR
 from src.model.losses import loss_labels, loss_boxes, loss_giou
-from src.model.detr_rfdetr import hungarian_matcher
 from src.data.coco_dataset import get_coco_loaders
 from scipy.optimize import linear_sum_assignment
-import torch.nn.functional as F
-import numpy as np
 
 # --- Training loop for RF-DETR ---
 def train_rfdetr(
@@ -106,27 +105,8 @@ def train_rfdetr(
 
 def simple_hungarian_matcher(pred_logits, pred_boxes, tgt_labels, tgt_boxes):
     """
-    Simple Hungarian matcher for DETR-style models.
-    Matches predictions to targets based on class and box L1 cost.
-    Returns list of (pred_idx, tgt_idx).
-    """
-    if len(tgt_labels) == 0 or len(pred_logits) == 0:
-        return []
-    # Compute classification cost (negative log-probability of target class)
-    out_prob = F.softmax(pred_logits, -1).detach().cpu().numpy()  # (num_queries, num_classes+1)
-    tgt_labels_np = tgt_labels.detach().cpu().numpy()
-    class_cost = -out_prob[:, tgt_labels_np]  # (num_queries, num_targets)
-    # Compute L1 bbox cost
-    pred_boxes_np = pred_boxes.detach().cpu().numpy()
-    tgt_boxes_np = tgt_boxes.detach().cpu().numpy()
-    bbox_cost = np.abs(pred_boxes_np[:, None, :] - tgt_boxes_np[None, :, :]).sum(-1)  # (num_queries, num_targets)
-    # Final cost matrix
-    C = class_cost + bbox_cost
-    row_ind, col_ind = linear_sum_assignment(C)
-    matches = list(zip(row_ind, col_ind))
-    return matches
 
-if __name__ == '__main__':
+# --- Hungarian Matcher ---
     # Example usage
     DATA_DIR = os.path.join(os.path.dirname(__file__), '..', 'data')
     NUM_CLASSES = 3  # BCCD: WBC, RBC, Platelets
