@@ -126,15 +126,25 @@ def simple_hungarian_matcher(pred_logits, pred_boxes, tgt_labels, tgt_boxes):
     if len(tgt_labels) == 0 or len(pred_logits) == 0:
         return []
     out_prob = F.softmax(pred_logits, -1).detach().cpu().numpy()  # (num_queries, num_classes+1)
-    tgt_labels_np = tgt_labels.detach().cpu().numpy()
+    tgt_labels_np = tgt_labels.detach().cpu().numpy()  # (num_targets,)
+    tgt_boxes_np = tgt_boxes.detach().cpu().numpy()  # (num_targets, 4)
+    
+    # Debug: print shapes
+    print(f"Matcher: out_prob shape {out_prob.shape}, tgt_labels_np shape {tgt_labels_np.shape}")
+    if tgt_labels_np.ndim == 0:
+        tgt_labels_np = np.expand_dims(tgt_labels_np, 0)
+    if tgt_labels_np.size == 0 or out_prob.ndim != 2:
+        print("Matcher: empty targets or invalid out_prob shape, returning []")
+        return []
+    
+    # Compute the classification cost.
     class_cost = -out_prob[:, tgt_labels_np]  # (num_queries, num_targets)
     pred_boxes_np = pred_boxes.detach().cpu().numpy()
-    tgt_boxes_np = tgt_boxes.detach().cpu().numpy()
     bbox_cost = np.abs(pred_boxes_np[:, None, :] - tgt_boxes_np[None, :, :]).sum(-1)  # (num_queries, num_targets)
+    # Final cost matrix
     C = class_cost + bbox_cost
     row_ind, col_ind = linear_sum_assignment(C)
-    matches = list(zip(row_ind, col_ind))
-    return matches
+    return list(zip(row_ind, col_ind))
 
 if __name__ == '__main__':
     DATA_DIR = os.path.join(os.path.dirname(__file__), '..', 'data')
