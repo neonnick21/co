@@ -40,13 +40,11 @@ def train_rfdetr(
             outputs = model(images)
             pred_logits = outputs['pred_logits']  # (batch, num_queries, num_classes+1)
             pred_boxes = outputs['pred_boxes']    # (batch, num_queries, 4)
-            batch_loss = 0.0
+            batch_losses = []
             for b in range(images.size(0)):
                 tgt_labels = targets[b]['labels'].to(device)
                 tgt_boxes = targets[b]['boxes'].to(device)
-                # Hungarian matching (indices: list of (pred_idx, tgt_idx))
                 indices = hungarian_matcher(pred_logits[b], pred_boxes[b], tgt_labels, tgt_boxes)
-                # For each matched pair, compute losses
                 if len(indices) == 0:
                     continue
                 pred_idx, tgt_idx = zip(*indices)
@@ -54,18 +52,17 @@ def train_rfdetr(
                 matched_boxes = pred_boxes[b][list(pred_idx)]
                 matched_labels = tgt_labels[list(tgt_idx)]
                 matched_boxes_gt = tgt_boxes[list(tgt_idx)]
-                # Losses
                 loss_cls = loss_labels(matched_logits, matched_labels)
                 loss_bbox = loss_boxes(matched_boxes, matched_boxes_gt)
                 loss_giou_val = loss_giou(matched_boxes, matched_boxes_gt)
                 total_loss = loss_cls + loss_bbox + loss_giou_val
-                batch_loss += total_loss
-            if images.size(0) > 0:
-                batch_loss = batch_loss / images.size(0)
-            optimizer.zero_grad()
-            batch_loss.backward()
-            optimizer.step()
-            total_loss += batch_loss.item()
+                batch_losses.append(total_loss)
+            if batch_losses:
+                batch_loss = torch.stack(batch_losses).mean()
+                optimizer.zero_grad()
+                batch_loss.backward()
+                optimizer.step()
+                total_loss += batch_loss.item()
         scheduler.step()
         avg_train_loss = total_loss / len(loaders['train'])
         # Validation
@@ -77,7 +74,7 @@ def train_rfdetr(
                 outputs = model(images)
                 pred_logits = outputs['pred_logits']
                 pred_boxes = outputs['pred_boxes']
-                batch_loss = 0.0
+                batch_losses = []
                 for b in range(images.size(0)):
                     tgt_labels = targets[b]['labels'].to(device)
                     tgt_boxes = targets[b]['boxes'].to(device)
@@ -93,10 +90,10 @@ def train_rfdetr(
                     loss_bbox = loss_boxes(matched_boxes, matched_boxes_gt)
                     loss_giou_val = loss_giou(matched_boxes, matched_boxes_gt)
                     total_loss = loss_cls + loss_bbox + loss_giou_val
-                    batch_loss += total_loss
-                if images.size(0) > 0:
-                    batch_loss = batch_loss / images.size(0)
-                val_loss += batch_loss.item()
+                    batch_losses.append(total_loss)
+                if batch_losses:
+                    batch_loss = torch.stack(batch_losses).mean()
+                    val_loss += batch_loss.item()
         avg_val_loss = val_loss / len(loaders['val'])
         print(f"Epoch {epoch+1}/{num_epochs} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
         # Early stopping
