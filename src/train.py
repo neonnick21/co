@@ -11,6 +11,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import StepLR
 from src.model.detr_rfdetr import RFDETR
 from src.model.losses import loss_labels, loss_boxes, loss_giou
+from src.model.detr_rfdetr import hungarian_matcher
 from src.data.coco_dataset import get_coco_loaders
 
 # --- Training loop for RF-DETR ---
@@ -35,15 +36,36 @@ def train_rfdetr(
         total_loss = 0
         for images, targets in loaders['train']:
             images = torch.stack(images).to(device)
-            # Prepare targets (implement Hungarian matching and loss aggregation)
-            # ...
-            optimizer.zero_grad()
+            # Prepare targets and predictions
             outputs = model(images)
-            # Placeholder: compute losses (implement matching logic)
-            loss = torch.tensor(0.0, requires_grad=True).to(device)
-            loss.backward()
+            pred_logits = outputs['pred_logits']  # (batch, num_queries, num_classes+1)
+            pred_boxes = outputs['pred_boxes']    # (batch, num_queries, 4)
+            batch_loss = 0.0
+            for b in range(images.size(0)):
+                tgt_labels = targets[b]['labels'].to(device)
+                tgt_boxes = targets[b]['boxes'].to(device)
+                # Hungarian matching (indices: list of (pred_idx, tgt_idx))
+                indices = hungarian_matcher(pred_logits[b], pred_boxes[b], tgt_labels, tgt_boxes)
+                # For each matched pair, compute losses
+                if len(indices) == 0:
+                    continue
+                pred_idx, tgt_idx = zip(*indices)
+                matched_logits = pred_logits[b][list(pred_idx)]
+                matched_boxes = pred_boxes[b][list(pred_idx)]
+                matched_labels = tgt_labels[list(tgt_idx)]
+                matched_boxes_gt = tgt_boxes[list(tgt_idx)]
+                # Losses
+                loss_cls = loss_labels(matched_logits, matched_labels)
+                loss_bbox = loss_boxes(matched_boxes, matched_boxes_gt)
+                loss_giou_val = loss_giou(matched_boxes, matched_boxes_gt)
+                total_loss = loss_cls + loss_bbox + loss_giou_val
+                batch_loss += total_loss
+            if images.size(0) > 0:
+                batch_loss = batch_loss / images.size(0)
+            optimizer.zero_grad()
+            batch_loss.backward()
             optimizer.step()
-            total_loss += loss.item()
+            total_loss += batch_loss.item()
         scheduler.step()
         avg_train_loss = total_loss / len(loaders['train'])
         # Validation
@@ -52,10 +74,29 @@ def train_rfdetr(
         with torch.no_grad():
             for images, targets in loaders['val']:
                 images = torch.stack(images).to(device)
-                # Prepare targets and compute losses
-                # ...
-                loss = torch.tensor(0.0).to(device)
-                val_loss += loss.item()
+                outputs = model(images)
+                pred_logits = outputs['pred_logits']
+                pred_boxes = outputs['pred_boxes']
+                batch_loss = 0.0
+                for b in range(images.size(0)):
+                    tgt_labels = targets[b]['labels'].to(device)
+                    tgt_boxes = targets[b]['boxes'].to(device)
+                    indices = hungarian_matcher(pred_logits[b], pred_boxes[b], tgt_labels, tgt_boxes)
+                    if len(indices) == 0:
+                        continue
+                    pred_idx, tgt_idx = zip(*indices)
+                    matched_logits = pred_logits[b][list(pred_idx)]
+                    matched_boxes = pred_boxes[b][list(pred_idx)]
+                    matched_labels = tgt_labels[list(tgt_idx)]
+                    matched_boxes_gt = tgt_boxes[list(tgt_idx)]
+                    loss_cls = loss_labels(matched_logits, matched_labels)
+                    loss_bbox = loss_boxes(matched_boxes, matched_boxes_gt)
+                    loss_giou_val = loss_giou(matched_boxes, matched_boxes_gt)
+                    total_loss = loss_cls + loss_bbox + loss_giou_val
+                    batch_loss += total_loss
+                if images.size(0) > 0:
+                    batch_loss = batch_loss / images.size(0)
+                val_loss += batch_loss.item()
         avg_val_loss = val_loss / len(loaders['val'])
         print(f"Epoch {epoch+1}/{num_epochs} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
         # Early stopping
