@@ -1,18 +1,11 @@
-# requirements.txt for RF-DETR Project
-# Core dependencies
-numpy
-pandas
-scikit-learn
-Pillow
 matplotlib
-pycocotools
-# Deep learning
+Pillow
 torch
 torchvision
-# Data augmentation
-albumentations
-# Jupyter (optional)
-jupyter
-# For downloading datasets (optional)
-kaggle
-roboflow
+requests
+transformers
+scipy
+accelerate
+safetensors
+torchmetrics
+tqdm
