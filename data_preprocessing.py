@@ -66,7 +66,8 @@ def get_transform(train: bool):
 
     # Convert bounding box format from XYWH (from COCO) to XYXY for consistency
     # with model's expected input and torchmetrics.
-    transforms.append(T.ConvertBoundingBoxFormat(T.BoundingBoxFormat.XYXY))
+    # CORRECTED: Use string "xyxy" instead of T.BoundingBoxFormat.XYXY
+    transforms.append(T.ConvertBoundingBoxFormat("xyxy"))
 
     return T.Compose(transforms)
 
@@ -124,9 +125,10 @@ class BccdDataset(Dataset):
         boxes = torch.tensor(boxes, dtype=torch.float32)
         labels = torch.tensor(labels, dtype=torch.int64)
 
-        # Wrap targets using tv_tensors.BoundingBoxes. Crucially, specify format="XYWH"
+        # Wrap targets using tv_tensors.BoundingBoxes. Crucially, specify format="xywh"
         # because COCO annotations are XYWH. The transforms will then convert it to XYXY.
-        target_boxes = tv_tensors.BoundingBoxes(boxes, format="XYWH", canvas_size=image.size[::-1]) # PIL size is (width, height), canvas_size is (height, width)
+        # CORRECTED: Use string "xywh" instead of T.BoundingBoxFormat.XYWH
+        target_boxes = tv_tensors.BoundingBoxes(boxes, format="xywh", canvas_size=image.size[::-1]) # PIL size is (width, height), canvas_size is (height, width)
         target_labels = tv_tensors.Label(labels)
 
         target = {
@@ -187,10 +189,6 @@ if __name__ == '__main__':
         transforms=None # No transforms for raw visualization
     )
     raw_image, raw_target = raw_dataset[0] # Get a raw image and target
-    
-    # Visualize using raw image and raw target, but convert boxes to XYXY if needed for visualization
-    # The visualize_sample function in a separate script could handle this.
-    # For now, just demonstrating data loading.
     
     # To display directly:
     # fig, ax = plt.subplots(1)
