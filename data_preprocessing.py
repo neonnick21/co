@@ -12,6 +12,7 @@ from torchvision import tv_tensors
 from torchvision.transforms import v2 as T
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+import numpy as np # Added for image conversion
 
 
 def download_and_extract_dataset(url: str, dest_path: Path):
@@ -128,7 +129,6 @@ class BccdDataset(Dataset):
         # because COCO annotations are XYWH. The transforms will then convert it to XYXY.
         target_boxes = tv_tensors.BoundingBoxes(boxes, format="xywh", canvas_size=image.size[::-1]) # PIL size is (width, height), canvas_size is (height, width)
         
-        # CORRECTED: Use the labels tensor directly, not tv_tensors.Label
         target_labels = labels
 
         target = {
@@ -175,7 +175,7 @@ if __name__ == '__main__':
     image, target = dataset_for_model[0]
     print("\n--- Processed Sample ---")
     print(f"Image shape: {image.shape}, type: {image.dtype}")
-    print("Target dict:", {k: v.shape if isinstance(v, torch.Tensor) else type(v) for k, v in target.items()}) # Added check for tensor to print shape
+    print("Target dict:", {k: v.shape if isinstance(v, torch.Tensor) else type(v) for k, v in target.items()})
     print(f"Sample target boxes (XYXY format): {target['boxes'][:2]}")
     print(f"Sample target labels: {target['labels'][:2]}")
     print("--------------------------\n")
@@ -188,19 +188,30 @@ if __name__ == '__main__':
         annotation_file=TRAIN_ANNOTATION_FILE,
         transforms=None # No transforms for raw visualization
     )
-    raw_image, raw_target = raw_dataset[0] # Get a raw image and target
+    # Get a raw image and target (assuming it's still good for visualization)
+    raw_image, raw_target = raw_dataset[0] 
     
-    # To display directly:
-    # fig, ax = plt.subplots(1)
-    # ax.imshow(raw_image)
-    # for i, box in enumerate(raw_target['boxes']):
-    #     # Convert raw XYWH box to matplotlib-compatible XYWH format for Rectangle patch
-    #     # Matplotlib expects [x, y, width, height] for Rectangle.
-    #     # Since raw_target['boxes'] is still XYWH, no conversion needed here for drawing.
-    #     x, y, w, h = box.tolist()
-    #     rect = patches.Rectangle((x, y), w, h, linewidth=1, edgecolor='r', facecolor='none')
-    #     ax.add_patch(rect)
-    #     label_name = raw_dataset.cat_id_to_name[raw_target['labels'][i].item()]
-    #     plt.text(x, y - 5, label_name, color='red', fontsize=8, bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
-    # plt.show()
-    print("Visual exploration test complete (requires manual plot display in a live environment).")
+    # To display directly in Colab:
+    # Explicitly create a figure and axes
+    plt.figure(figsize=(10, 8)) # You can adjust the figure size
+    ax = plt.gca() # Get current axes, or use plt.subplots(1) if preferred
+
+    # Convert PIL Image to numpy array for matplotlib imshow
+    # raw_image is a PIL Image because transforms=None
+    ax.imshow(np.array(raw_image)) 
+
+    for i, box in enumerate(raw_target['boxes']):
+        # raw_target['boxes'] are tv_tensors.BoundingBoxes in XYWH format as specified in Dataset
+        # Matplotlib's Rectangle expects [x, y, width, height]
+        x, y, w, h = box.tolist() 
+        rect = patches.Rectangle((x, y), w, h, linewidth=2, edgecolor='r', facecolor='none') # Increased linewidth for visibility
+        ax.add_patch(rect)
+        label_name = raw_dataset.cat_id_to_name[raw_target['labels'][i].item()]
+        plt.text(x, y - 5, label_name, color='red', fontsize=10, # Adjusted font size
+                 bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=1)) # Added padding and increased alpha
+    
+    plt.title("Sample Image with Ground Truth Bounding Boxes")
+    plt.axis('off') # Hide axes for cleaner image
+    plt.show() # Display the plot
+
+    print("Visual exploration test complete.")
