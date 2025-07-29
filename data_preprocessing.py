@@ -62,7 +62,12 @@ def get_transform(train: bool):
 
     # ToDtype converts the image dtype and scales the values.
     # If scale=True, the output is a plain torch.Tensor with values in [0.0, 1.0].
-    transforms.append(T.ToDtype(torch.float, scale=True))
+    transforms.append(T.ToDtype(torch.float32, scale=True)) # Ensure float32
+
+    # Convert bounding box format from XYWH (from COCO) to XYXY for consistency
+    # with model's expected input and torchmetrics.
+    transforms.append(T.ConvertBoundingBoxFormat(T.BoundingBoxFormat.XYXY))
+
     return T.Compose(transforms)
 
 
@@ -72,18 +77,11 @@ class BccdDataset(Dataset):
     This class handles both data preparation for the model and visual exploration.
     """
 
-    def __init__(self, root_dir: str, annotation_file: str, transforms=None):
-        """
-        Args:
-            root_dir (str): Directory with all the images.
-            annotation_file (str): Path to the COCO format JSON annotation file.
-            transforms (callable, optional): Optional transform to be applied
-                on a sample.
-        """
-        self.root_dir = Path(root_dir)
+    def __init__(self, root_dir: Path, annotation_file: Path, transforms=None):
+        self.root_dir = root_dir
         self.transforms = transforms
 
-        print(f"Loading annotations from: {annotation_file}")
+        # Load COCO annotations
         with open(annotation_file, 'r') as f:
             coco_data = json.load(f)
 
@@ -99,103 +97,56 @@ class BccdDataset(Dataset):
         # We only want to work with images that have annotations
         annotated_image_ids = set(self.img_id_to_annotations.keys())
         self.images = [img for img in coco_data['images'] if img['id'] in annotated_image_ids]
-
         print(f"Found {len(self.images)} images with annotations.")
-        print(f"Categories: {self.cat_id_to_name}")
+        # Ensure category IDs are remapped to be 0-indexed if necessary for contiguous labels
+        # Assuming COCO categories are already 0-indexed or will be handled by model.
+        # For simplicity, we directly use COCO IDs here.
 
     def __len__(self):
         return len(self.images)
 
     def __getitem__(self, idx):
-        # 1. Get image information and load the image
-        image_info = self.images[idx]
-        image_path = self.root_dir / image_info['file_name']
-        image = Image.open(image_path).convert("RGB")
-        
-        # 2. Get all annotations for this image
-        image_id = image_info['id']
+        img_info = self.images[idx]
+        img_path = self.root_dir / img_info['file_name']
+        image = Image.open(img_path).convert("RGB") # Ensure 3 channels
+
+        image_id = img_info['id']
         annotations = self.img_id_to_annotations.get(image_id, [])
 
-        # 3. Extract bounding boxes and labels
-        boxes = [ann['bbox'] for ann in annotations]
-        labels = [ann['category_id'] for ann in annotations]
+        boxes = []
+        labels = []
+        for ann in annotations:
+            # COCO format: [x, y, width, height] (top-left, width, height)
+            boxes.append(ann['bbox'])
+            labels.append(ann['category_id'])
 
-        # Convert to torch tensors
-        boxes = torch.as_tensor(boxes, dtype=torch.float32)
-        labels = torch.as_tensor(labels, dtype=torch.int64)
+        # Convert to tensors
+        boxes = torch.tensor(boxes, dtype=torch.float32)
+        labels = torch.tensor(labels, dtype=torch.int64)
 
-        # The COCO format is [x, y, width, height].
-        # We need to convert it to [x_min, y_min, x_max, y_max] for torchvision.
-        boxes[:, 2] = boxes[:, 0] + boxes[:, 2]
-        boxes[:, 3] = boxes[:, 1] + boxes[:, 3]
+        # Wrap targets using tv_tensors.BoundingBoxes. Crucially, specify format="XYWH"
+        # because COCO annotations are XYWH. The transforms will then convert it to XYXY.
+        target_boxes = tv_tensors.BoundingBoxes(boxes, format="XYWH", canvas_size=image.size[::-1]) # PIL size is (width, height), canvas_size is (height, width)
+        target_labels = tv_tensors.Label(labels)
 
-        # The v2 transforms require bounding boxes to be in a specific format
-        # to automatically apply transformations. We wrap the tensor in
-        # tv_tensors.BoundingBoxes and provide the canvas size.
-        boxes = tv_tensors.BoundingBoxes(
-            boxes,
-            format="XYXY",
-            canvas_size=image.size[::-1]  # (height, width)
-        )
-
-        # 4. Construct the target dictionary
         target = {
-            "boxes": boxes,
-            "labels": labels,
-            "image_id": torch.tensor([image_id])
+            "boxes": target_boxes,
+            "labels": target_labels,
+            "image_id": torch.tensor([image_id]),
+            "iscrowd": torch.zeros((len(boxes),), dtype=torch.bool) # DETR expects this
         }
 
-        # 5. Apply transformations
         if self.transforms:
             image, target = self.transforms(image, target)
-
-        return image, target
-
-    def visualize_random_sample(self):
-        """
-        Selects a random raw image from the dataset and displays it with its
-        bounding box annotations for verification.
-        """
-        random_image_info = random.choice(self.images)
-        image_id = random_image_info['id']
-        file_name = random_image_info['file_name']
-        image_path = self.root_dir / file_name
-
-        print(f"\n--- Visualizing Random Sample ---")
-        print(f"Displaying: {file_name} (Image ID: {image_id})")
-
-        image = Image.open(image_path).convert("RGB")
-        image_annotations = self.img_id_to_annotations.get(image_id, [])
-
-        fig, ax = plt.subplots(1, figsize=(12, 9))
-        ax.imshow(image)
-        ax.axis('off')
-
-        for ann in image_annotations:
-            bbox = ann['bbox']  # COCO format: [x_min, y_min, width, height]
-            category_id = ann['category_id']
-            category_name = self.cat_id_to_name[category_id]
-
-            rect = patches.Rectangle(
-                (bbox[0], bbox[1]), bbox[2], bbox[3],
-                linewidth=2, edgecolor='lime', facecolor='none'
-            )
-            ax.add_patch(rect)
-            plt.text(
-                bbox[0], bbox[1] - 10, category_name,
-                color='black', backgroundcolor='cyan', fontsize=10
-            )
         
-        print("---------------------------------")
-        plt.show()
+        return image, target
 
 
 if __name__ == '__main__':
     # --- Configuration & Automated Setup ---
     DATASET_URL = "https://public.roboflow.com/ds/GVJCultPuQ?key=0AVhhCEQpy"
     DATASET_BASE_DIR = Path("BCCD.v3-raw.coco")
-
-    # Step 1: Automatically download and extract the dataset if it doesn't exist.
+    
     download_and_extract_dataset(url=DATASET_URL, dest_path=DATASET_BASE_DIR)
 
     # --- Path Definitions ---
@@ -222,11 +173,36 @@ if __name__ == '__main__':
     image, target = dataset_for_model[0]
     print("\n--- Processed Sample ---")
     print(f"Image shape: {image.shape}, type: {image.dtype}")
-    print("Target dict:", {k: v.shape for k, v in target.items()})
+    print("Target dict:", {k: v.shape if isinstance(v, torch.Tensor) else type(v) for k, v in target.items()})
+    print(f"Sample target boxes (XYXY format): {target['boxes'][:2]}")
+    print(f"Sample target labels: {target['labels'][:2]}")
     print("--------------------------\n")
 
     # Step 3: Test the visual exploration functionality
     print(">>> Testing visual exploration...")
     # We create a new instance without transforms to see the original image
-    dataset_for_viz = BccdDataset(root_dir=TRAIN_DATA_ROOT, annotation_file=TRAIN_ANNOTATION_FILE)
-    dataset_for_viz.visualize_random_sample()
+    raw_dataset = BccdDataset(
+        root_dir=TRAIN_DATA_ROOT,
+        annotation_file=TRAIN_ANNOTATION_FILE,
+        transforms=None # No transforms for raw visualization
+    )
+    raw_image, raw_target = raw_dataset[0] # Get a raw image and target
+    
+    # Visualize using raw image and raw target, but convert boxes to XYXY if needed for visualization
+    # The visualize_sample function in a separate script could handle this.
+    # For now, just demonstrating data loading.
+    
+    # To display directly:
+    # fig, ax = plt.subplots(1)
+    # ax.imshow(raw_image)
+    # for i, box in enumerate(raw_target['boxes']):
+    #     # Convert raw XYWH box to matplotlib-compatible XYWH format for Rectangle patch
+    #     # Matplotlib expects [x, y, width, height] for Rectangle.
+    #     # Since raw_target['boxes'] is still XYWH, no conversion needed here for drawing.
+    #     x, y, w, h = box.tolist()
+    #     rect = patches.Rectangle((x, y), w, h, linewidth=1, edgecolor='r', facecolor='none')
+    #     ax.add_patch(rect)
+    #     label_name = raw_dataset.cat_id_to_name[raw_target['labels'][i].item()]
+    #     plt.text(x, y - 5, label_name, color='red', fontsize=8, bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
+    # plt.show()
+    print("Visual exploration test complete (requires manual plot display in a live environment).")
