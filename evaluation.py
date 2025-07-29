@@ -9,6 +9,7 @@ from data_preprocessing import BccdDataset, get_transform, download_and_extract_
 from torchmetrics.detection import MeanAveragePrecision
 from torchmetrics import MetricCollection # Import MetricCollection
 import matplotlib.pyplot as plt
+import numpy as np # Import numpy for image conversion
 
 def custom_collate_fn(batch):
     """
@@ -31,23 +32,32 @@ def post_process_predictions(pred_logits, pred_boxes, threshold=0.5):
     """
     Converts raw model outputs (logits and boxes) into a format suitable for
     torchmetrics, filtering predictions based on a confidence threshold.
+    Corrects bounding box format from cxcywh (normalized) to xyxy (normalized).
 
     Args:
         pred_logits (torch.Tensor): Predicted class logits from the model.
                                     Shape: [batch_size, num_queries, num_classes]
-        pred_boxes (torch.Tensor): Predicted bounding box coordinates (normalized).
+        pred_boxes (torch.Tensor): Predicted bounding box coordinates (normalized cxcywh).
                                    Shape: [batch_size, num_queries, 4]
         threshold (float): Confidence threshold to filter predictions.
 
     Returns:
         list[dict]: A list of dictionaries, one per image in the batch, where
                     each dictionary contains 'boxes', 'scores', and 'labels'
-                    for the detected objects.
+                    for the detected objects in xyxy format.
     """
     results = []
     
-    # Sigmoid is not needed here as it's already applied in the bbox_head
-    for logits, boxes in zip(pred_logits, pred_boxes):
+    for logits, boxes_cxcywh in zip(pred_logits, pred_boxes):
+        # Convert boxes from cxcywh (normalized) to xyxy (normalized)
+        # boxes_cxcywh shape: [num_queries, 4] -> [cx, cy, w, h]
+        cx, cy, w, h = boxes_cxcywh.unbind(-1)
+        x1 = cx - 0.5 * w
+        y1 = cy - 0.5 * h
+        x2 = cx + 0.5 * w
+        y2 = cy + 0.5 * h
+        boxes_xyxy = torch.stack((x1, y1, x2, y2), dim=-1)
+
         # Apply softmax to get probabilities for each class
         probs = F.softmax(logits, dim=-1)
         # Get the highest score and corresponding label for each query,
@@ -58,9 +68,9 @@ def post_process_predictions(pred_logits, pred_boxes, threshold=0.5):
         keep = scores > threshold
         
         results.append({
-            "boxes": boxes[keep],    # Bounding boxes for kept predictions
-            "scores": scores[keep],  # Confidence scores for kept predictions
-            "labels": labels[keep],  # Class labels for kept predictions
+            "boxes": boxes_xyxy[keep], # Use the converted xyxy boxes
+            "scores": scores[keep],  
+            "labels": labels[keep],  
         })
     return results
 
@@ -89,7 +99,8 @@ def evaluate(model, data_loader, num_classes, device):
         for images, targets in data_loader:
             # Move images and targets to the specified device
             images = images.to(device)
-            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+            # Ensure targets are on the correct device for metric calculation
+            targets_on_device = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
             # Get model predictions
             pred_logits, pred_boxes = model(images)
@@ -98,7 +109,7 @@ def evaluate(model, data_loader, num_classes, device):
             preds = post_process_predictions(pred_logits, pred_boxes)
             
             # Update the metric with the current batch's predictions and targets
-            metric.update(preds, targets)
+            metric.update(preds, targets_on_device)
             
     # Compute the final metrics across all batches
     metrics_result = metric.compute()
@@ -124,11 +135,10 @@ def visualize_predictions(model, dataset, device, num_images=3, threshold=0.5):
         random_indices = torch.randint(0, len(dataset), (num_images,)).tolist()
 
         for i, idx in enumerate(random_indices):
-            # Get image and target from the dataset
-            # image is already a torch.Tensor here, typically [C, H, W] float.
+            # Get image and target from the dataset (they will be on CPU initially)
             image, target = dataset[idx]
             
-            # Prepare image for model input: add batch dimension and move to device
+            # Move image to device for model input
             image_tensor = image.unsqueeze(0).to(device)
 
             # Get predictions
@@ -137,37 +147,30 @@ def visualize_predictions(model, dataset, device, num_images=3, threshold=0.5):
             preds = post_process_predictions(pred_logits, pred_boxes, threshold=threshold)[0]
             
             # Denormalize bounding box coordinates to pixel values
-            # Assuming input images are resized to a fixed size (e.g., 640x480) before entering the model.
-            # If your `get_transform` resizes, use those dimensions. Otherwise, use image.shape.
-            # Here assuming standard practice where images are scaled to a common size, e.g., 640x480
-            # You might need to adjust H, W based on your actual data_preprocessing.py transformations
-            # If no explicit resize in get_transform, use image.shape[1] (height) and image.shape[2] (width)
-            if image.dim() == 3: # Check if it's a single image [C, H, W]
-                _, h, w = image.shape
-            else: # If for some reason it's still [H, W, C] (e.g. from PIL directly before ToImage)
-                h, w, _ = image.shape
+            # image.shape is [C, H, W]
+            _, h, w = image.shape
             
-            preds_boxes_denorm = preds['boxes'] * torch.tensor([w, h, w, h], device=device)
-            target_boxes_denorm = target['boxes'] * torch.tensor([w, h, w, h], device=device)
+            # Ensure target tensors are on the same device as the scaling tensor before multiplication
+            # predictions from post_process_predictions are already xyxy format (normalized)
+            preds_boxes_denorm = preds['boxes'].cpu() * torch.tensor([w, h, w, h], device='cpu')
+            target_boxes_denorm = target['boxes'].cpu() * torch.tensor([w, h, w, h], device='cpu')
 
             # Convert image tensor to PIL Image for drawing
             # Permute from [C, H, W] to [H, W, C] and convert to numpy, then to uint8
-            original_image = Image.fromarray((image.permute(1, 2, 0).cpu().numpy() * 255).astype('uint8'))
+            # Ensure image is on CPU before converting to numpy
+            original_image = Image.fromarray((image.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8))
             draw = ImageDraw.Draw(original_image)
             
             # Get class names for displaying labels
-            # The dataset.cat_id_to_name mapping should be available
-            # Ensure the mapping is correct (category_id -> name)
             category_names = dataset.cat_id_to_name
-            # If category_ids start from 0 and are sequential, it's fine.
-            # If not, ensure the dictionary maps correctly.
+            # Reverse map for class ID to name if necessary, or ensure direct access by ID.
+            # Assuming category_names is {id: 'name'} as loaded from dataset.
 
             # Draw ground truth bounding boxes in green
             for j in range(len(target['boxes'])):
                 box = target_boxes_denorm[j].cpu().numpy().tolist()
                 label = target['labels'][j].item()
                 
-                # Ensure label exists in category_names to avoid KeyError
                 label_name = category_names.get(label, f"Unknown_{label}")
                 
                 draw.rectangle(box, outline="green", width=2)
@@ -183,12 +186,11 @@ def visualize_predictions(model, dataset, device, num_images=3, threshold=0.5):
                 label = preds['labels'][j].item()
                 score = preds['scores'][j].item()
 
-                # Ensure label exists in category_names
                 label_name = category_names.get(label, f"Unknown_{label}")
 
                 draw.rectangle(box, outline="red", width=2)
                 draw.text(
-                    (box[0], box[1] + 5), # Offset text slightly to avoid overlap with GT
+                    (box[0], box[1] + 5), 
                     f"Pred: {label_name} ({score:.2f})", 
                     fill="red"
                 )
@@ -202,8 +204,6 @@ def visualize_predictions(model, dataset, device, num_images=3, threshold=0.5):
     plt.tight_layout()
     plt.show()
 
-# The main execution block will only run if this script is executed directly,
-# preventing it from running when imported by hyperparameter_tuning.py
 if __name__ == '__main__':
     # --- Configuration & Automated Setup ---
     DATASET_URL = "https://public.roboflow.com/ds/GVJCultPuQ?key=0AVhhCEQpy"
@@ -242,16 +242,26 @@ if __name__ == '__main__':
 
     # --- Print Metrics ---
     print("\n--- Evaluation Results ---")
-    # Corrected key access for MeanAveragePrecision output (when class_metrics=True)
     print(f"Mean Average Precision (mAP): {metrics['map']:.4f}")
     print(f"mAP@0.50 IoU: {metrics['map_50']:.4f}")
     print(f"mAP@0.75 IoU: {metrics['map_75']:.4f}")
-    # MeanAveragePrecision directly provides overall precision and recall
-    # under these keys when class_metrics=True
-    print(f"Mean Precision: {metrics['detection_precision']:.4f}")
-    print(f"Mean Recall: {metrics['detection_recall']:.4f}")
+    print(f"Mean Average Recall (mAR) @ maxDets=100: {metrics['mar_100']:.4f}")
+
+    print("\n--- Per-Class mAP ---")
+    # Invert the mapping for easier lookup of class name by ID
+    class_id_to_name = {v: k for k, v in val_dataset.cat_id_to_name.items()}
+    # Filter out 'no-object' class if it's implicitly included in metrics['classes'] and causes issues
+    for i, class_map in enumerate(metrics['map_per_class']):
+        class_id = metrics['classes'][i].item()
+        # Ensure we only print for actual object classes (not 'no-object' if it's assigned a class ID)
+        if class_id in class_id_to_name:
+            class_name = class_id_to_name[class_id]
+            print(f"  {class_name}: {class_map:.4f}")
+        # else:
+            # print(f"  Unknown Class ID {class_id}: {class_map:.4f}") # For debugging if unexpected class IDs appear
+    
     print("--------------------------")
     
     # --- Visualize Predictions ---
     print("\n>>> Visualizing predictions on sample images...")
-    visualize_predictions(model, val_dataset, device, num_images=3, threshold=0.7) # Added threshold
+    visualize_predictions(model, val_dataset, device, num_images=3, threshold=0.7)
