@@ -2,7 +2,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 import torch.optim as optim
-from model import RFDETR, compute_loss # Import updated compute_loss
+from model import RFDETR, compute_loss  # Import updated compute_loss
 from data_preprocessing import BccdDataset, get_transform, download_and_extract_dataset
 
 def custom_collate_fn(batch):
@@ -37,7 +37,7 @@ if __name__ == '__main__':
     )
     print(f"Dataset size: {len(dataset)}")
 
-    num_classes = len(dataset.cat_id_to_name) + 1 # +1 for 'no-object' class
+    num_classes = len(dataset.cat_id_to_name) + 1  # +1 for 'no-object' class
     print(f"Number of classes (including no-object): {num_classes}")
 
     train_loader = DataLoader(dataset, batch_size=8, shuffle=True, collate_fn=custom_collate_fn)
@@ -49,55 +49,76 @@ if __name__ == '__main__':
     model.to(device)
     model.train()
 
-    # --- DIAGNOSTIC CHANGE: Temporarily lower learning rate ---
-    # If 1e-4 is still too high, try 1e-5 or 1e-6 to see if it stabilizes.
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4) 
-    # You can try: optimizer = optim.AdamW(model.parameters(), lr=1e-5) 
-    # Or even: optimizer = optim.AdamW(model.parameters(), lr=1e-6) 
-    # If it stabilizes at a very low LR, then 1e-4 is indeed too aggressive.
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4)
 
     num_epochs = 50
     for epoch in range(num_epochs):
         total_loss = 0
+        total_class_loss_epoch = 0
+        total_bbox_l1_loss_epoch = 0
+        total_giou_loss_epoch = 0
+        num_batches = 0
 
-        for images, targets in train_loader:
+        for batch_idx, (images, targets) in enumerate(train_loader):
             optimizer.zero_grad()
             
             images = images.to(device)
-            # Ensure target boxes are float32 and labels are int64
             targets_processed = []
+            img_width, img_height = images.shape[2], images.shape[3]  # Get image dimensions
+
             for t in targets:
+                # Normalize target boxes to [0, 1]
+                normalized_boxes = t['boxes'].clone()  # Clone to avoid modifying original
+                normalized_boxes[:, 0] /= img_width
+                normalized_boxes[:, 1] /= img_height
+                normalized_boxes[:, 2] /= img_width
+                normalized_boxes[:, 3] /= img_height
+
                 targets_processed.append({
-                    "boxes": t["boxes"].to(device).float(),
+                    "boxes": normalized_boxes.to(device).float(),
                     "labels": t["labels"].to(device).long(),
                     "image_id": t["image_id"].to(device)
                 })
 
             pred_logits, pred_boxes = model(images)
             
-            loss = compute_loss(pred_logits, pred_boxes, targets_processed, num_classes, device)
+            # Commented out debugging prints
+            # if batch_idx == 0 and epoch == 0:  # Only print for the first batch of the first epoch
+            #     print(f"DEBUG: Epoch {epoch+1}, Batch {batch_idx}, Predicted boxes (first 5): {pred_boxes[0, :5]}")
+            #     print(f"DEBUG: Epoch {epoch+1}, Batch {batch_idx}, Predicted boxes min/max: {pred_boxes.min().item():.4f}/{pred_boxes.max().item():.4f}")
+
+            loss, class_loss_val, bbox_l1_loss_val, giou_loss_val = compute_loss(
+                pred_logits, pred_boxes, targets_processed, num_classes, device
+            )
             
-            # Check if loss is NaN/Inf before backward pass
             if torch.isnan(loss) or torch.isinf(loss):
-                print(f"Epoch {epoch+1}, Batch: Loss is NaN or Inf. Skipping backward pass.")
-                # You might want to break here or handle it more gracefully
+                print(f"Epoch {epoch+1}, Batch {batch_idx}: Loss is NaN or Inf. Skipping backward pass.")
                 continue 
 
             loss.backward()
-            
-            # --- CRUCIAL CHANGE: Add Gradient Clipping ---
-            # This prevents gradients from exploding, which often leads to NaN/Inf.
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # max_norm can be adjusted (e.g., 0.1, 5.0)
-            # ---------------------------------------------
-
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
+            
             total_loss += loss.item()
+            total_class_loss_epoch += class_loss_val.item()
+            total_bbox_l1_loss_epoch += bbox_l1_loss_val.item()
+            total_giou_loss_epoch += giou_loss_val.item()
+            num_batches += 1
 
-        avg_loss = total_loss / len(train_loader)
-        print(f"Epoch [{epoch + 1}/{num_epochs}], Loss: {avg_loss:.4f}")
+        if num_batches == 0:  # Handle case where all batches were skipped due to NaN/Inf
+            print(f"Epoch [{epoch + 1}/{num_epochs}], No valid batches processed. Loss remains high.")
+            continue
+
+        avg_loss = total_loss / num_batches
+        avg_class_loss = total_class_loss_epoch / num_batches
+        avg_bbox_l1_loss = total_bbox_l1_loss_epoch / num_batches
+        avg_giou_loss = total_giou_loss_epoch / num_batches
+
+        print(f"Epoch [{epoch + 1}/{num_epochs}], Total Loss: {avg_loss:.4f}, "
+              f"Class Loss: {avg_class_loss:.4f}, L1 Loss: {avg_bbox_l1_loss:.4f}, "
+              f"GIoU Loss: {avg_giou_loss:.4f}")
 
     print("Training complete.")
     
     torch.save(model.state_dict(), 'rfd_et-r_model.pth')
     print("Model saved to rfd_et-r_model.pth")
-
