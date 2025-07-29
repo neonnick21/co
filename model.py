@@ -92,8 +92,8 @@ class RFDETR(nn.Module):
         
         # Prediction Heads
         self.class_head = nn.Linear(256, num_classes)
-        self.bbox_head = nn.Linear(256, 4)
-
+        self.bbox_head = nn.Linear(256, 4) # Outputs cx, cy, w, h (normalized)
+        
         # Query embeddings
         self.query_embeddings = nn.Embedding(num_queries, 256)
 
@@ -106,6 +106,7 @@ class RFDETR(nn.Module):
         nn.init.constant_(self.bbox_head.bias, 0)
 
     def create_rfe_module(self):
+        # A simple block to enhance features
         return nn.Sequential(
             nn.Conv2d(256, 256, kernel_size=3, padding=1),
             nn.ReLU(),
@@ -113,155 +114,162 @@ class RFDETR(nn.Module):
             nn.ReLU()
         )
 
-    def forward(self, images):
-        features = self.backbone_layers(images) 
-        if torch.isnan(features).any() or torch.isinf(features).any():
-            print("DEBUG: NaN/Inf in backbone features!")
-            return torch.zeros(images.shape[0], self.query_embeddings.num_embeddings, self.class_head.out_features, device=images.device), \
-                   torch.zeros(images.shape[0], self.query_embeddings.num_embeddings, 4, device=images.device)
+    def forward(self, x):
+        # Backbone features
+        features = self.backbone_layers(x) # e.g., [B, 2048, H/32, W/32]
+        
+        # Channel reduction
+        features = self.channel_reduction(features) # [B, 256, H/32, W/32]
+        
+        # Apply RFE module
+        features = self.rfe_module(features)
 
-        reduced_features = self.channel_reduction(features)
-        if torch.isnan(reduced_features).any() or torch.isinf(reduced_features).any():
-            print("DEBUG: NaN/Inf in reduced_features!")
-            return torch.zeros(images.shape[0], self.query_embeddings.num_embeddings, self.class_head.out_features, device=images.device), \
-                   torch.zeros(images.shape[0], self.query_embeddings.num_embeddings, 4, device=images.device)
+        # Positional encoding (assuming features are [B, C, H, W])
+        pos_embed = self.position_embedding(features) # [1, H*W, 256*2] if using 128 pos feats
 
-        enhanced_features = self.rfe_module(reduced_features)
-        if torch.isnan(enhanced_features).any() or torch.isinf(enhanced_features).any():
-            print("DEBUG: NaN/Inf in enhanced_features (after RFE)!")
-            return torch.zeros(images.shape[0], self.query_embeddings.num_embeddings, self.class_head.out_features, device=images.device), \
-                   torch.zeros(images.shape[0], self.query_embeddings.num_embeddings, 4, device=images.device)
+        # Flatten features for transformer input: [B, H*W, C]
+        features_flat = features.flatten(2).permute(0, 2, 1) # [B, H*W, 256]
         
-        pos_embed = self.position_embedding(enhanced_features)  # [1, H*W, 256]
-        
-        bs, c, h_feat, w_feat = enhanced_features.shape
-        flattened_features = enhanced_features.flatten(2).permute(0, 2, 1)  # [bs, H_feat*W_feat, 256]
-        
-        features_with_pos = flattened_features + pos_embed
-        
-        if torch.isnan(features_with_pos).any() or torch.isinf(features_with_pos).any():
-            print("DEBUG: NaN/Inf in features_with_pos (after adding PE)!")
-            return torch.zeros(images.shape[0], self.query_embeddings.num_embeddings, self.class_head.out_features, device=images.device), \
-                   torch.zeros(images.shape[0], self.query_embeddings.num_embeddings, 4, device=images.device)
-        
-        memory = self.transformer_encoder(features_with_pos)
-        if torch.isnan(memory).any() or torch.isinf(memory).any():
-            print("DEBUG: NaN/Inf in transformer encoder memory!")
-            return torch.zeros(images.shape[0], self.query_embeddings.num_embeddings, self.class_head.out_features, device=images.device), \
-                   torch.zeros(images.shape[0], self.query_embeddings.num_embeddings, 4, device=images.device)
-        
-        queries = self.query_embeddings.weight.unsqueeze(0).repeat(bs, 1, 1)
-        
-        outputs = self.transformer_decoder(queries, memory)
-        if torch.isnan(outputs).any() or torch.isinf(outputs).any():
-            print("DEBUG: NaN/Inf in transformer decoder outputs!")
-            return torch.zeros(images.shape[0], self.query_embeddings.num_embeddings, self.class_head.out_features, device=images.device), \
-                   torch.zeros(images.shape[0], self.query_embeddings.num_embeddings, 4, device=images.device)
-        
-        class_logits = self.class_head(outputs)
-        bbox_preds = self.bbox_head(outputs).sigmoid().clamp(min=1e-4, max=1-1e-4) 
+        # Expand pos_embed to batch_size
+        # pos_embed is [1, H*W, C_pos], we need to broadcast to [B, H*W, C_pos]
+        # and match its last dim to features_flat's last dim (256).
+        # Assuming num_pos_feats=128, then pos_embed's last dim is 256 (128*2 for sin/cos).
+        # We need to ensure that the transformer's d_model (256) matches this.
+        # Here, pos_embed should directly align with d_model.
+        # My PositionEmbeddingSine returns [1, H*W, 2 * num_pos_feats], and 2*128=256, so it matches.
+        pos_embed_broadcast = pos_embed.expand(features_flat.shape[0], -1, -1)
 
-        if torch.isnan(class_logits).any() or torch.isinf(class_logits).any():
-            print("DEBUG: NaN/Inf in final class_logits!")
-            return torch.zeros(images.shape[0], self.query_embeddings.num_embeddings, self.class_head.out_features, device=images.device), \
-                   torch.zeros(images.shape[0], self.query_embeddings.num_embeddings, 4, device=images.device)
-        if torch.isnan(bbox_preds).any() or torch.isinf(bbox_preds).any():
-            print("DEBUG: NaN/Inf in final bbox_preds!")
-            return torch.zeros(images.shape[0], self.query_embeddings.num_embeddings, self.class_head.out_features, device=images.device), \
-                   torch.zeros(images.shape[0], self.query_embeddings.num_embeddings, 4, device=images.device)
+        # Transformer Encoder
+        # The transformer expects src, src_key_padding_mask, pos
+        # For simplicity, we directly add pos_embed to features for now as a common DETR practice.
+        # A more robust DETR encoder also uses a mask and proper positional encoding integration.
+        memory = self.transformer_encoder(src=features_flat, pos=pos_embed_broadcast)
         
-        return class_logits, bbox_preds
+        # Prepare query embeddings
+        query_embed = self.query_embeddings.weight.unsqueeze(0).repeat(x.shape[0], 1, 1) # [B, num_queries, 256]
 
-def compute_loss(pred_logits, pred_boxes, targets, num_classes, device,
-                 cost_class_weight=1.0, cost_bbox_weight=5.0, cost_giou_weight=2.0,
-                 loss_class_weight=1.0, loss_bbox_weight=5.0, loss_giou_weight=2.0):
+        # Transformer Decoder
+        # tgt (target for decoder) is query_embed. memory is output from encoder.
+        # query_pos is query_embed itself as positional encoding for queries.
+        hs = self.transformer_decoder(tgt=query_embed, memory=memory, pos=pos_embed_broadcast) # hs: [B, num_queries, 256]
+
+        # Prediction Heads (applied to output of decoder)
+        # hs: [B, num_queries, D] where D is d_model (256)
+        pred_logits = self.class_head(hs) # [B, num_queries, num_classes]
+        pred_boxes = torch.sigmoid(self.bbox_head(hs)) # [B, num_queries, 4] - normalized cx, cy, w, h
+        
+        return pred_logits, pred_boxes
+
+
+def compute_loss(pred_logits, pred_boxes, targets, num_classes, device):
     """
-    Computes the total loss for a batch of predictions and targets using bipartite matching.
+    Computes the total loss for DETR, including classification, L1 bounding box, and GIoU loss.
+    This function performs Hungarian matching between predictions and ground truth.
+
+    Args:
+        pred_logits (torch.Tensor): Predicted class logits from the model.
+                                    Shape: [batch_size, num_queries, num_classes]
+        pred_boxes (torch.Tensor): Predicted bounding box coordinates (normalized cxcywh).
+                                   Shape: [batch_size, num_queries, 4]
+        targets (list[dict]): List of dictionaries, each containing 'boxes' and 'labels'
+                              for a single image in the batch.
+                              'boxes' are expected to be normalized XYXY.
+        num_classes (int): Total number of classes including the 'no-object' class.
+        device (torch.device): The device (CPU or CUDA) where tensors reside.
+
+    Returns:
+        tuple: (total_loss, class_loss, bbox_l1_loss, giou_loss)
     """
-    total_class_loss = torch.tensor(0.0, device=device)
-    total_bbox_l1_loss = torch.tensor(0.0, device=device)
-    total_giou_loss = torch.tensor(0.0, device=device)
+    batch_size = pred_logits.shape[0]
 
-    batch_size, num_queries = pred_logits.shape[:2]
-    no_object_class_label = num_classes - 1  # Assuming last class is 'no-object'
+    total_class_loss = 0.0
+    total_bbox_l1_loss = 0.0
+    total_giou_loss = 0.0
 
+    # Loss weights (can be tuned)
+    # The last class is 'no-object'
     # --- ADJUSTED LOSS WEIGHTS (for debugging) ---
-    loss_class_weight_adjusted = 0.1 
-    loss_bbox_weight_adjusted = 1.0  # Changed from 5.0
-    loss_giou_weight_adjusted = 2.0
+    loss_class_weight_adjusted = 1.0 # Increased importance
+    loss_bbox_weight_adjusted = 5.0  # Common in DETR
+    loss_giou_weight_adjusted = 2.0  # Common in DETR
     # ---------------------------------------------
 
     for i in range(batch_size):
-        pred_logits_i = pred_logits[i]  # [num_queries, num_classes]
-        pred_boxes_i = pred_boxes[i]    # [num_queries, 4]
-        target_labels_i = targets[i]['labels']  # [num_targets]
-        target_boxes_i = targets[i]['boxes']    # [num_targets, 4]
+        pred_logits_i = pred_logits[i] # [num_queries, num_classes]
+        pred_boxes_i = pred_boxes[i]   # [num_queries, 4] (normalized cxcywh)
+        
+        target_labels_i = targets[i]['labels'] # [num_targets]
+        target_boxes_i = targets[i]['boxes']   # [num_targets, 4] (normalized xyxy from data_preprocessing)
 
         num_targets = len(target_labels_i)
+        num_queries = pred_logits_i.shape[0]
 
-        # If there are no ground truth objects in this image,
-        # all queries should predict 'no-object'.
+        # 1. Compute Cost Matrix for Hungarian Matching
+        # Cost = Classification Cost + Bounding Box L1 Cost + GIoU Cost
+
+        # Classification Cost (Negative Log Likelihood)
+        # Assuming last class is 'no-object'
+        out_prob = F.softmax(pred_logits_i, dim=-1) # [num_queries, num_classes]
+        cost_class = -out_prob[:, target_labels_i] # [num_queries, num_targets]
+
+        # Bounding Box Cost (L1 Distance)
+        # Convert pred_boxes_i from cxcywh to xyxy for cost calculation and loss
+        cx, cy, w, h = pred_boxes_i.unbind(-1)
+        pred_boxes_xyxy = torch.stack((cx - 0.5 * w, cy - 0.5 * h, cx + 0.5 * w, cy + 0.5 * h), dim=-1) # [num_queries, 4]
+
+        # L1 Cost
+        cost_bbox_l1 = torch.cdist(pred_boxes_xyxy, target_boxes_i, p=1) # [num_queries, num_targets]
+
+        # GIoU Cost
+        # generalized_box_iou returns a matrix of IoUs, not cost. Cost is 1 - IoU.
+        # Make sure inputs are xyxy format
+        giou_matrix = generalized_box_iou(pred_boxes_xyxy, target_boxes_i) # [num_queries, num_targets]
+        cost_giou = 1 - giou_matrix
+
+        # Total Cost Matrix (weighted)
+        # Weights for costs can be different from loss weights
+        C = 0.1 * cost_class + 1.0 * cost_bbox_l1 + 1.0 * cost_giou # These weights are for matching, not loss scale
+
+        # Hungarian Matching
         if num_targets == 0:
-            class_loss = F.cross_entropy(
-                pred_logits_i, 
-                torch.full((num_queries,), no_object_class_label, dtype=torch.long, device=device)
-            )
-            total_class_loss += class_loss
-            continue 
+            # If no ground truth objects, all queries should predict 'no-object'
+            # Only classification loss applies for 'no-object'
+            cost_class_no_obj = -F.log_softmax(pred_logits_i, dim=-1)[:, num_classes - 1].mean()
+            total_class_loss += cost_class_no_obj
+            continue
 
-        # --- Compute Cost Matrix for Hungarian Matching ---
-        log_probs = F.log_softmax(pred_logits_i, dim=-1)  # [num_queries, num_classes]
-        cost_class = -log_probs[:, target_labels_i]  # [num_queries, num_targets]
+        # Convert cost matrix to CPU for linear_sum_assignment (SciPy function)
+        C = C.cpu()
+        row_ind, col_ind = linear_sum_assignment(C) # row_ind: query indices, col_ind: target indices
 
-        cost_bbox = torch.cdist(pred_boxes_i, target_boxes_i, p=1)  # [num_queries, num_targets]
-        cost_giou = 1 - generalized_box_iou(pred_boxes_i, target_boxes_i)  # [num_queries, num_targets]
+        # Filter out invalid assignments if any (shouldn't happen with full queries)
+        row_ind = torch.tensor(row_ind, dtype=torch.int64, device=device)
+        col_ind = torch.tensor(col_ind, dtype=torch.int64, device=device)
 
-        # Combine costs with weights
-        C = cost_class_weight * cost_class + \
-            cost_bbox_weight * cost_bbox + \
-            cost_giou_weight * cost_giou
+        # 2. Classification Loss (for matched predictions)
+        # For matched queries, compute cross-entropy loss with their assigned target labels
+        matched_pred_logits = pred_logits_i[row_ind] # Logits for matched queries
+        matched_target_labels = target_labels_i[col_ind] # Labels for matched targets
         
-        if torch.isnan(C).any() or torch.isinf(C).any():
-            print(f"Warning: NaN or Inf found in cost matrix C for image {i}. Skipping this image.")
-            continue 
+        class_loss = F.cross_entropy(matched_pred_logits, matched_target_labels, reduction='mean')
+        total_class_loss += class_loss
 
-        C_np = C.detach().cpu().numpy()
-        row_ind, col_ind = linear_sum_assignment(C_np)
+        # 3. Bounding Box L1 Loss and GIoU Loss (for matched predictions)
+        # pred_boxes_i are cxcywh from model, need to be converted to xyxy for F.l1_loss and generalized_box_iou_loss
+        # target_boxes_i are xyxy from data_preprocessing
+        
+        # Convert matched_pred_boxes from cxcywh to xyxy for loss calculation
+        matched_pred_boxes_cxcywh = pred_boxes_i[row_ind] # [num_matched, 4]
+        
+        cx, cy, w, h = matched_pred_boxes_cxcywh.unbind(-1)
+        matched_pred_boxes_xyxy = torch.stack((cx - 0.5 * w, cy - 0.5 * h, cx + 0.5 * w, cy + 0.5 * h), dim=-1) # [num_matched, 4]
 
-        # --- Calculate Losses based on Matching ---
+        matched_target_boxes = target_boxes_i[col_ind] # [num_matched, 4]
 
-        # 1. Classification Loss
-        matched_pred_logits = pred_logits_i[row_ind]
-        matched_target_labels = target_labels_i[col_ind]
-        class_loss_matched = F.cross_entropy(matched_pred_logits, matched_target_labels)
-        total_class_loss += class_loss_matched
-
-        unmatched_queries_mask = torch.ones(num_queries, dtype=torch.bool, device=device)
-        unmatched_queries_mask[row_ind] = False 
-
-        num_unmatched_queries = torch.sum(unmatched_queries_mask).item()
-        if num_unmatched_queries > 0:
-            class_loss_unmatched = F.cross_entropy(
-                pred_logits_i[unmatched_queries_mask], 
-                torch.full((num_unmatched_queries,), no_object_class_label, dtype=torch.long, device=device)
-            )
-            total_class_loss += class_loss_unmatched
-
-        # 2. Bounding Box L1 Loss
-        matched_pred_boxes = pred_boxes_i[row_ind]
-        matched_target_boxes = target_boxes_i[col_ind]
-
-        # Ensure matched boxes are in the expected range
-        # Commented out debugging prints for matched boxes
-        # if matched_pred_boxes.numel() > 0:
-        #     print(f"DEBUG: Image {i}, Matched Pred Boxes min/max: {matched_pred_boxes.min().item():.4f}/{matched_pred_boxes.max().item():.4f}")
-        #     print(f"DEBUG: Image {i}, Matched Target Boxes min/max: {matched_target_boxes.min().item():.4f}/{matched_target_boxes.max().item():.4f}")
-
-        bbox_l1_loss = F.l1_loss(matched_pred_boxes, matched_target_boxes, reduction='mean')
+        bbox_l1_loss = F.l1_loss(matched_pred_boxes_xyxy, matched_target_boxes, reduction='mean')
         total_bbox_l1_loss += bbox_l1_loss
 
-        # 3. GIoU Loss
-        giou_loss = generalized_box_iou_loss(matched_pred_boxes, matched_target_boxes, reduction='mean')
+        giou_loss = generalized_box_iou_loss(matched_pred_boxes_xyxy, matched_target_boxes, reduction='mean')
         total_giou_loss += giou_loss
 
     # Average losses over the batch
@@ -272,9 +280,11 @@ def compute_loss(pred_logits, pred_boxes, targets, num_classes, device,
     avg_bbox_l1_loss_val = total_bbox_l1_loss / effective_batch_size
     avg_giou_loss_val = total_giou_loss / effective_batch_size
 
-    final_loss = (loss_class_weight_adjusted * avg_class_loss_val) + \
-                 (loss_bbox_weight_adjusted * avg_bbox_l1_loss_val) + \
-                 (loss_giou_weight_adjusted * avg_giou_loss_val)
+    # Total weighted loss
+    final_loss = (
+        loss_class_weight_adjusted * avg_class_loss_val +
+        loss_bbox_weight_adjusted * avg_bbox_l1_loss_val +
+        loss_giou_weight_adjusted * avg_giou_loss_val
+    )
 
-    # Ensure we always return values
     return final_loss, avg_class_loss_val, avg_bbox_l1_loss_val, avg_giou_loss_val
