@@ -100,7 +100,8 @@ def evaluate(model, data_loader, num_classes, device):
             # Move images and targets to the specified device
             images = images.to(device)
             # Ensure targets are on the correct device for metric calculation
-            targets_on_device = [{k: v.to(device) for k, v in t.items()} for t in targets]
+            # Also ensure target boxes are XYXY as expected by torchmetrics
+            targets_on_device = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in targets]
 
             # Get model predictions
             pred_logits, pred_boxes = model(images)
@@ -132,7 +133,9 @@ def visualize_predictions(model, dataset, device, num_images=3, threshold=0.5):
     plt.figure(figsize=(15, 5 * num_images))
     with torch.no_grad(): # Disable gradient calculations
         # Select random indices for visualization
-        random_indices = torch.randint(0, len(dataset), (num_images,)).tolist()
+        # Ensure we don't pick more images than available in the dataset
+        num_images = min(num_images, len(dataset))
+        random_indices = torch.randperm(len(dataset))[:num_images].tolist()
 
         for i, idx in enumerate(random_indices):
             # Get image and target from the dataset (they will be on CPU initially)
@@ -144,15 +147,17 @@ def visualize_predictions(model, dataset, device, num_images=3, threshold=0.5):
             # Get predictions
             pred_logits, pred_boxes = model(image_tensor)
             # Post-process predictions for the single image (batch size 1)
+            # The post_process_predictions handles cxcywh to xyxy conversion
             preds = post_process_predictions(pred_logits, pred_boxes, threshold=threshold)[0]
             
             # Denormalize bounding box coordinates to pixel values
-            # image.shape is [C, H, W]
+            # image.shape is [C, H, W] after transformations
             _, h, w = image.shape
             
-            # Ensure target tensors are on the same device as the scaling tensor before multiplication
             # predictions from post_process_predictions are already xyxy format (normalized)
             preds_boxes_denorm = preds['boxes'].cpu() * torch.tensor([w, h, w, h], device='cpu')
+            
+            # target['boxes'] are already xyxy and normalized from data_preprocessing
             target_boxes_denorm = target['boxes'].cpu() * torch.tensor([w, h, w, h], device='cpu')
 
             # Convert image tensor to PIL Image for drawing
@@ -173,6 +178,7 @@ def visualize_predictions(model, dataset, device, num_images=3, threshold=0.5):
                 
                 label_name = category_names.get(label, f"Unknown_{label}")
                 
+                # Draw rectangle: (x1, y1, x2, y2)
                 draw.rectangle(box, outline="green", width=2)
                 draw.text(
                     (box[0], box[1] - 10), 
@@ -188,6 +194,7 @@ def visualize_predictions(model, dataset, device, num_images=3, threshold=0.5):
 
                 label_name = category_names.get(label, f"Unknown_{label}")
 
+                # Draw rectangle: (x1, y1, x2, y2)
                 draw.rectangle(box, outline="red", width=2)
                 draw.text(
                     (box[0], box[1] + 5), 
@@ -198,7 +205,7 @@ def visualize_predictions(model, dataset, device, num_images=3, threshold=0.5):
             # Display the image
             plt.subplot(num_images, 1, i + 1)
             plt.imshow(original_image)
-            plt.title(f"Image {idx} - Predictions (red) vs Ground Truth (green)")
+            plt.title(f"Image {idx} - Predictions (red) vs Ground Truth (green) - Threshold: {threshold}")
             plt.axis('off')
     
     plt.tight_layout()
@@ -245,23 +252,23 @@ if __name__ == '__main__':
     print(f"Mean Average Precision (mAP): {metrics['map']:.4f}")
     print(f"mAP@0.50 IoU: {metrics['map_50']:.4f}")
     print(f"mAP@0.75 IoU: {metrics['map_75']:.4f}")
-    print(f"Mean Average Recall (mAR) @ maxDets=100: {metrics['mar_100']:.4f}")
+    print(f"Mean Average Recall (mAR) @ maxDets=100: {metrics['mar_100']:.4f}") # Corrected key for mAR
 
     print("\n--- Per-Class mAP ---")
     # Invert the mapping for easier lookup of class name by ID
-    class_id_to_name = {v: k for k, v in val_dataset.cat_id_to_name.items()}
-    # Filter out 'no-object' class if it's implicitly included in metrics['classes'] and causes issues
+    # Ensure that metrics['classes'] are 0-indexed and align with your dataset's category IDs
+    # `torchmetrics` will return the class IDs for which it computed per-class metrics
     for i, class_map in enumerate(metrics['map_per_class']):
-        class_id = metrics['classes'][i].item()
-        # Ensure we only print for actual object classes (not 'no-object' if it's assigned a class ID)
-        if class_id in class_id_to_name:
-            class_name = class_id_to_name[class_id]
+        class_id = metrics['classes'][i].item() # Get the actual class ID
+        # Only print for actual object classes (not 'no-object' or unknown IDs if present)
+        if class_id in val_dataset.cat_id_to_name:
+            class_name = val_dataset.cat_id_to_name[class_id]
             print(f"  {class_name}: {class_map:.4f}")
-        # else:
-            # print(f"  Unknown Class ID {class_id}: {class_map:.4f}") # For debugging if unexpected class IDs appear
     
     print("--------------------------")
     
     # --- Visualize Predictions ---
     print("\n>>> Visualizing predictions on sample images...")
+    # Consider lowering the threshold here (e.g., to 0.3 or 0.5) if you still see no boxes
+    # in the visualization after the fixes, to check for low-confidence predictions.
     visualize_predictions(model, val_dataset, device, num_images=3, threshold=0.7)
