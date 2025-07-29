@@ -66,7 +66,6 @@ def get_transform(train: bool):
 
     # Convert bounding box format from XYWH (from COCO) to XYXY for consistency
     # with model's expected input and torchmetrics.
-    # CORRECTED: Use string "xyxy" instead of T.BoundingBoxFormat.XYXY
     transforms.append(T.ConvertBoundingBoxFormat("xyxy"))
 
     return T.Compose(transforms)
@@ -123,13 +122,14 @@ class BccdDataset(Dataset):
 
         # Convert to tensors
         boxes = torch.tensor(boxes, dtype=torch.float32)
-        labels = torch.tensor(labels, dtype=torch.int64)
+        labels = torch.tensor(labels, dtype=torch.int64) # Labels should be a standard torch.Tensor
 
         # Wrap targets using tv_tensors.BoundingBoxes. Crucially, specify format="xywh"
         # because COCO annotations are XYWH. The transforms will then convert it to XYXY.
-        # CORRECTED: Use string "xywh" instead of T.BoundingBoxFormat.XYWH
         target_boxes = tv_tensors.BoundingBoxes(boxes, format="xywh", canvas_size=image.size[::-1]) # PIL size is (width, height), canvas_size is (height, width)
-        target_labels = tv_tensors.Label(labels)
+        
+        # CORRECTED: Use the labels tensor directly, not tv_tensors.Label
+        target_labels = labels
 
         target = {
             "boxes": target_boxes,
@@ -175,7 +175,7 @@ if __name__ == '__main__':
     image, target = dataset_for_model[0]
     print("\n--- Processed Sample ---")
     print(f"Image shape: {image.shape}, type: {image.dtype}")
-    print("Target dict:", {k: v.shape if isinstance(v, torch.Tensor) else type(v) for k, v in target.items()})
+    print("Target dict:", {k: v.shape if isinstance(v, torch.Tensor) else type(v) for k, v in target.items()}) # Added check for tensor to print shape
     print(f"Sample target boxes (XYXY format): {target['boxes'][:2]}")
     print(f"Sample target labels: {target['labels'][:2]}")
     print("--------------------------\n")
